@@ -1,6 +1,6 @@
 // can't use rustfmt here because it screws up the file.
 #![cfg_attr(rustfmt, rustfmt_skip)]
-use crate::types::{FromRedisValue, ToRedisArgs, RedisResult, NumericBehavior};
+use crate::types::{FromRedisValue, ToRedisArgs, RedisResult, RedisFuture, NumericBehavior};
 use crate::connection::{ConnectionLike, Msg, Connection};
 use crate::cmd::{cmd, Cmd, Pipeline, Iter};
 
@@ -9,6 +9,7 @@ use crate::geo;
 
 macro_rules! implement_commands {
     (
+        $lifetime: lifetime
         $(
             $(#[$attr:meta])+
             fn $name:ident<$($tyargs:ident : $ty:ident),*>(
@@ -40,6 +41,7 @@ macro_rules! implement_commands {
         /// use redis::Commands;
         /// let client = redis::Client::open("redis://127.0.0.1/")?;
         /// let mut con = client.get_connection()?;
+        /// let () = con.set("my_key", 42)?;
         /// assert_eq!(con.get("my_key"), Ok(42));
         /// # Ok(()) }
         /// ```
@@ -47,7 +49,7 @@ macro_rules! implement_commands {
             $(
                 $(#[$attr])*
                 #[inline]
-                fn $name<$($tyargs: $ty,)* RV: FromRedisValue>(
+                fn $name<$lifetime, $($tyargs: $ty, )* RV: FromRedisValue>(
                     &mut self $(, $argname: $argty)*) -> RedisResult<RV>
                     { ($body).query(self) }
             )*
@@ -121,6 +123,52 @@ macro_rules! implement_commands {
             }
         }
 
+
+        /// Implements common redis commands for connection like objects.  This
+        /// allows you to send commands straight to a connection or client.  It
+        /// is also implemented for redis results of clients which makes for
+        /// very convenient access in some basic cases.
+        ///
+        /// This allows you to use nicer syntax for some common operations.
+        /// For instance this code:
+        ///
+        /// ```rust,no_run
+        /// use redis::AsyncCommands;
+        /// # async fn do_something() -> redis::RedisResult<()> {
+        /// let client = redis::Client::open("redis://127.0.0.1/")?;
+        /// let mut con = client.get_async_connection().await?;
+        /// let () = redis::cmd("SET").arg("my_key").arg(42i32).query_async(&mut con).await?;
+        /// assert_eq!(redis::cmd("GET").arg("my_key").query_async(&mut con).await, Ok(42i32));
+        /// # Ok(()) }
+        /// ```
+        ///
+        /// Will become this:
+        ///
+        /// ```rust,no_run
+        /// use redis::AsyncCommands;
+        /// # async fn do_something() -> redis::RedisResult<()> {
+        /// use redis::Commands;
+        /// let client = redis::Client::open("redis://127.0.0.1/")?;
+        /// let mut con = client.get_async_connection().await?;
+        /// let () = con.set("my_key", 42i32).await?;
+        /// assert_eq!(con.get("my_key").await, Ok(42i32));
+        /// # Ok(()) }
+        /// ```
+        pub trait AsyncCommands : crate::aio::ConnectionLike + Send + Sized {
+            $(
+                $(#[$attr])*
+                #[inline]
+                fn $name<$lifetime, $($tyargs: $ty + Send + Sync + $lifetime,)* RV>(
+                    & $lifetime mut self
+                    $(, $argname: $argty)*
+                    ) -> RedisFuture<'a, RV>
+                where RV: FromRedisValue,
+                {
+                    Box::pin(async move { ($body).query_async(self).await })
+                }
+            )*
+        }
+
         /// Implements common redis commands for pipelines.  Unlike the regular
         /// commands trait, this returns the pipeline rather than a result
         /// directly.  Other than that it works the same however.
@@ -131,7 +179,7 @@ macro_rules! implement_commands {
             $(
                 $(#[$attr])*
                 #[inline]
-                fn $name<$($tyargs: $ty),*>(
+                fn $name<$lifetime, $($tyargs: $ty),*>(
                     &mut self $(, $argname: $argty)*) -> &mut Self
                     { self.perform(::std::mem::replace($body, Cmd::new())) }
             )*
@@ -140,6 +188,7 @@ macro_rules! implement_commands {
 }
 
 implement_commands! {
+    'a
     // most common operations
 
     /// Get the value of a key.  If key is a vec this becomes an `MGET`.
@@ -158,7 +207,7 @@ implement_commands! {
     }
 
     /// Sets multiple keys to their values.
-    fn set_multiple<K: ToRedisArgs, V: ToRedisArgs>(items: &[(K, V)]) {
+    fn set_multiple<K: ToRedisArgs, V: ToRedisArgs>(items: &'a [(K, V)]) {
         cmd("MSET").arg(items)
     }
 
@@ -173,7 +222,7 @@ implement_commands! {
     }
 
     /// Sets multiple keys to their values failing if at least one already exists.
-    fn mset_nx<K: ToRedisArgs, V: ToRedisArgs>(items: &[(K, V)]) {
+    fn mset_nx<K: ToRedisArgs, V: ToRedisArgs>(items: &'a [(K, V)]) {
         cmd("MSETNX").arg(items)
     }
 
@@ -331,7 +380,7 @@ implement_commands! {
     }
 
     /// Sets a multiple fields in a hash.
-    fn hset_multiple<K: ToRedisArgs, F: ToRedisArgs, V: ToRedisArgs>(key: K, items: &[(F, V)]) {
+    fn hset_multiple<K: ToRedisArgs, F: ToRedisArgs, V: ToRedisArgs>(key: K, items: &'a [(F, V)]) {
         cmd("HMSET").arg(key).arg(items)
     }
 
@@ -553,7 +602,7 @@ implement_commands! {
     }
 
     /// Add multiple members to a sorted set, or update its score if it already exists.
-    fn zadd_multiple<K: ToRedisArgs, S: ToRedisArgs, M: ToRedisArgs>(key: K, items: &[(S, M)]) {
+    fn zadd_multiple<K: ToRedisArgs, S: ToRedisArgs, M: ToRedisArgs>(key: K, items: &'a [(S, M)]) {
         cmd("ZADD").arg(key).arg(items)
     }
 
@@ -575,19 +624,19 @@ implement_commands! {
 
     /// Intersect multiple sorted sets and store the resulting sorted set in
     /// a new key using SUM as aggregation function.
-    fn zinterstore<K: ToRedisArgs>(dstkey: K, keys: &[K]) {
+    fn zinterstore<K: ToRedisArgs>(dstkey: K, keys: &'a [K]) {
         cmd("ZINTERSTORE").arg(dstkey).arg(keys.len()).arg(keys)
     }
 
     /// Intersect multiple sorted sets and store the resulting sorted set in
     /// a new key using MIN as aggregation function.
-    fn zinterstore_min<K: ToRedisArgs>(dstkey: K, keys: &[K]) {
+    fn zinterstore_min<K: ToRedisArgs>(dstkey: K, keys: &'a [K]) {
         cmd("ZINTERSTORE").arg(dstkey).arg(keys.len()).arg(keys).arg("AGGREGATE").arg("MIN")
     }
 
     /// Intersect multiple sorted sets and store the resulting sorted set in
     /// a new key using MAX as aggregation function.
-    fn zinterstore_max<K: ToRedisArgs>(dstkey: K, keys: &[K]) {
+    fn zinterstore_max<K: ToRedisArgs>(dstkey: K, keys: &'a [K]) {
         cmd("ZINTERSTORE").arg(dstkey).arg(keys.len()).arg(keys).arg("AGGREGATE").arg("MAX")
     }
 
@@ -725,19 +774,19 @@ implement_commands! {
 
     /// Unions multiple sorted sets and store the resulting sorted set in
     /// a new key using SUM as aggregation function.
-    fn zunionstore<K: ToRedisArgs>(dstkey: K, keys: &[K]) {
+    fn zunionstore<K: ToRedisArgs>(dstkey: K, keys: &'a [K]) {
         cmd("ZUNIONSTORE").arg(dstkey).arg(keys.len()).arg(keys)
     }
 
     /// Unions multiple sorted sets and store the resulting sorted set in
     /// a new key using MIN as aggregation function.
-    fn zunionstore_min<K: ToRedisArgs>(dstkey: K, keys: &[K]) {
+    fn zunionstore_min<K: ToRedisArgs>(dstkey: K, keys: &'a [K]) {
         cmd("ZUNIONSTORE").arg(dstkey).arg(keys.len()).arg(keys).arg("AGGREGATE").arg("MIN")
     }
 
     /// Unions multiple sorted sets and store the resulting sorted set in
     /// a new key using MAX as aggregation function.
-    fn zunionstore_max<K: ToRedisArgs>(dstkey: K, keys: &[K]) {
+    fn zunionstore_max<K: ToRedisArgs>(dstkey: K, keys: &'a [K]) {
         cmd("ZUNIONSTORE").arg(dstkey).arg(keys.len()).arg(keys).arg("AGGREGATE").arg("MAX")
     }
 
@@ -1025,6 +1074,8 @@ pub trait PubSubCommands: Sized {
 }
 
 impl<T> Commands for T where T: ConnectionLike {}
+
+impl<T> AsyncCommands for T where T: crate::aio::ConnectionLike + Send + ?Sized {}
 
 impl PubSubCommands for Connection {
     fn subscribe<C, F, U>(&mut self, channels: C, mut func: F) -> RedisResult<U>
