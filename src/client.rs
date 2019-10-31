@@ -76,8 +76,8 @@ impl Client {
             }
         }
 
-        let con = self.get_async_connection().await?;
-        crate::aio::MultiplexedConnection::new(con, TokioExecutor)
+        self.get_multiplexed_async_connection_with_executor(TokioExecutor)
+            .await
     }
 
     /// Returns an async multiplexed connection from the client.
@@ -94,7 +94,7 @@ impl Client {
         E: task::Spawn,
     {
         let con = self.get_async_connection().await?;
-        crate::aio::MultiplexedConnection::new(con, executor)
+        Ok(crate::aio::MultiplexedConnection::new(con, executor))
     }
 }
 
