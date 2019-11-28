@@ -9,14 +9,13 @@ use std::pin::Pin;
 use tokio::net::UnixStream;
 
 use tokio::{
-    io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
 use tokio_util::codec::Decoder;
 
 use futures::{
-    future::Either,
     prelude::*,
     ready,
     task::{self, Poll},
@@ -32,13 +31,12 @@ use crate::connection::{ConnectionAddr, ConnectionInfo};
 
 use crate::parser::ValueCodec;
 
-enum ActualConnection {
-    Tcp(Buffered<TcpStream>),
+#[doc(hidden)]
+pub enum ActualConnection {
+    Tcp(TcpStream),
     #[cfg(unix)]
-    Unix(Buffered<UnixStream>),
+    Unix(UnixStream),
 }
-
-type Buffered<T> = BufReader<BufWriter<T>>;
 
 impl AsyncWrite for ActualConnection {
     fn poll_write(
@@ -84,38 +82,26 @@ impl AsyncRead for ActualConnection {
     }
 }
 
-impl AsyncBufRead for ActualConnection {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<io::Result<&[u8]>> {
-        match self.get_mut() {
-            ActualConnection::Tcp(r) => Pin::new(r).poll_fill_buf(cx),
-            #[cfg(unix)]
-            ActualConnection::Unix(r) => Pin::new(r).poll_fill_buf(cx),
-        }
-    }
-
-    fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        match &mut *self {
-            ActualConnection::Tcp(r) => Pin::new(r).consume(amt),
-            #[cfg(unix)]
-            ActualConnection::Unix(r) => Pin::new(r).consume(amt),
-        }
-    }
-}
-
 /// Represents a stateful redis TCP connection.
-pub struct Connection {
-    con: ActualConnection,
+
+pub struct Connection<W = ActualConnection> {
+    con: BufWriter<BufReader<W>>,
     db: i64,
 }
 
-impl ActualConnection {
-    pub async fn read_response(&mut self) -> RedisResult<Value> {
-        crate::parser::parse_redis_value_async(self).await
+impl<W> Connection<W>
+where
+    W: AsyncRead + AsyncWrite + Unpin,
+{
+    async fn read_response(&mut self) -> RedisResult<Value> {
+        crate::parser::parse_redis_value_async(&mut self.con).await
     }
 }
 
 /// Opens a connection.
-pub async fn connect(connection_info: &ConnectionInfo) -> RedisResult<Connection> {
+pub async fn connect(
+    connection_info: &ConnectionInfo,
+) -> RedisResult<Connection<ActualConnection>> {
     let con = match *connection_info.addr {
         ConnectionAddr::Tcp(ref host, port) => {
             let socket_addr = {
@@ -132,14 +118,14 @@ pub async fn connect(connection_info: &ConnectionInfo) -> RedisResult<Connection
             };
 
             TcpStream::connect(&socket_addr)
-                .map_ok(|con| ActualConnection::Tcp(BufReader::new(BufWriter::new(con))))
+                .map_ok(|con| ActualConnection::Tcp(con))
                 .await?
         }
 
         #[cfg(unix)]
         ConnectionAddr::Unix(ref path) => {
             UnixStream::connect(path)
-                .map_ok(|stream| ActualConnection::Unix(BufReader::new(BufWriter::new(stream))))
+                .map_ok(|stream| ActualConnection::Unix(stream))
                 .await?
         }
 
@@ -154,7 +140,7 @@ pub async fn connect(connection_info: &ConnectionInfo) -> RedisResult<Connection
     };
 
     let mut rv = Connection {
-        con,
+        con: BufWriter::new(BufReader::new(con)),
         db: connection_info.db,
     };
 
@@ -214,12 +200,15 @@ pub trait ConnectionLike: Sized {
     fn get_db(&self) -> i64;
 }
 
-impl ConnectionLike for Connection {
+impl<W> ConnectionLike for Connection<W>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
         (async move {
             cmd.write_command_async(Pin::new(&mut self.con)).await?;
             self.con.flush().await?;
-            self.con.read_response().await
+            self.read_response().await
         })
             .boxed()
     }
@@ -235,12 +224,12 @@ impl ConnectionLike for Connection {
             self.con.flush().await?;
 
             for _ in 0..offset {
-                self.con.read_response().await?;
+                self.read_response().await?;
             }
 
             let mut rv = Vec::with_capacity(count);
             for _ in 0..count {
-                rv.push(self.con.read_response().await?);
+                rv.push(self.read_response().await?);
             }
 
             Ok(rv)
@@ -501,28 +490,13 @@ pub struct MultiplexedConnection {
 
 impl MultiplexedConnection {
     /// Creates a multiplexed connection from a connection and executor.
-    pub(crate) fn new(con: Connection) -> (Self, impl Future<Output = ()>) {
-        let (pipeline, driver) = match con.con {
-            #[cfg(not(unix))]
-            ActualConnection::Tcp(tcp) => {
-                let codec = ValueCodec::default().framed(tcp.into_inner().into_inner());
-                let (pipeline, driver) = Pipeline::new(codec);
-                (pipeline, driver)
-            }
+    pub(crate) fn new<W>(con: Connection<W>) -> (Self, impl Future<Output = ()>)
+    where
+        W: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let codec = ValueCodec::default().framed(con.con);
+        let (pipeline, driver) = Pipeline::new(codec);
 
-            #[cfg(unix)]
-            ActualConnection::Tcp(tcp) => {
-                let codec = ValueCodec::default().framed(tcp.into_inner().into_inner());
-                let (pipeline, driver) = Pipeline::new(codec);
-                (pipeline, Either::Left(driver))
-            }
-            #[cfg(unix)]
-            ActualConnection::Unix(unix) => {
-                let codec = ValueCodec::default().framed(unix.into_inner().into_inner());
-                let (pipeline, driver) = Pipeline::new(codec);
-                (pipeline, Either::Right(driver))
-            }
-        };
         (
             MultiplexedConnection {
                 pipeline,
