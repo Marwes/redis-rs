@@ -72,8 +72,11 @@ impl Client {
     pub async fn get_multiplexed_async_connection(
         &self,
     ) -> RedisResult<(crate::aio::MultiplexedConnection, impl Future<Output = ()>)> {
-        let con = self.get_async_connection().await?;
-        Ok(crate::aio::MultiplexedConnection::new(con))
+        let con: crate::aio::Connection<tokio::io::BufReader<crate::aio::TokioConnection>> =
+            crate::aio::connect(&self.connection_info).await?;
+        Ok(crate::aio::MultiplexedConnection::new(
+            con.map(|buf_reader| buf_reader.into_inner()),
+        ))
     }
 }
 

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use tokio::net::UnixStream;
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
@@ -32,117 +32,170 @@ use crate::connection::{ConnectionAddr, ConnectionInfo};
 use crate::parser::ValueCodec;
 
 #[doc(hidden)]
-pub enum ActualConnection {
+pub enum TokioConnection {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
 }
 
-impl AsyncWrite for ActualConnection {
+impl AsyncWrite for TokioConnection {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match &mut *self {
-            ActualConnection::Tcp(r) => Pin::new(r).poll_write(cx, buf),
+            TokioConnection::Tcp(r) => Pin::new(r).poll_write(cx, buf),
             #[cfg(unix)]
-            ActualConnection::Unix(r) => Pin::new(r).poll_write(cx, buf),
+            TokioConnection::Unix(r) => Pin::new(r).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<io::Result<()>> {
         match &mut *self {
-            ActualConnection::Tcp(r) => Pin::new(r).poll_flush(cx),
+            TokioConnection::Tcp(r) => Pin::new(r).poll_flush(cx),
             #[cfg(unix)]
-            ActualConnection::Unix(r) => Pin::new(r).poll_flush(cx),
+            TokioConnection::Unix(r) => Pin::new(r).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<io::Result<()>> {
         match &mut *self {
-            ActualConnection::Tcp(r) => Pin::new(r).poll_shutdown(cx),
+            TokioConnection::Tcp(r) => Pin::new(r).poll_shutdown(cx),
             #[cfg(unix)]
-            ActualConnection::Unix(r) => Pin::new(r).poll_shutdown(cx),
+            TokioConnection::Unix(r) => Pin::new(r).poll_shutdown(cx),
         }
     }
 }
 
-impl AsyncRead for ActualConnection {
+impl AsyncRead for TokioConnection {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         match &mut *self {
-            ActualConnection::Tcp(r) => Pin::new(r).poll_read(cx, buf),
+            TokioConnection::Tcp(r) => Pin::new(r).poll_read(cx, buf),
             #[cfg(unix)]
-            ActualConnection::Unix(r) => Pin::new(r).poll_read(cx, buf),
+            TokioConnection::Unix(r) => Pin::new(r).poll_read(cx, buf),
         }
     }
 }
 
 /// Represents a stateful redis TCP connection.
 
-pub struct Connection<W = ActualConnection> {
-    con: BufWriter<BufReader<W>>,
+pub struct Connection<C = BufWriter<BufReader<TokioConnection>>> {
+    con: C,
     db: i64,
 }
 
-impl<W> Connection<W>
+impl<C> Connection<C>
 where
-    W: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + Unpin,
 {
     async fn read_response(&mut self) -> RedisResult<Value> {
         crate::parser::parse_redis_value_async(&mut self.con).await
     }
 }
 
-/// Opens a connection.
-pub async fn connect(
-    connection_info: &ConnectionInfo,
-) -> RedisResult<Connection<ActualConnection>> {
-    let con = match *connection_info.addr {
-        ConnectionAddr::Tcp(ref host, port) => {
-            let socket_addr = {
-                let mut socket_addrs = (&host[..], port).to_socket_addrs()?;
-                match socket_addrs.next() {
-                    Some(socket_addr) => socket_addr,
-                    None => {
-                        return Err(RedisError::from((
-                            ErrorKind::InvalidClientConfig,
-                            "No address found for host",
-                        )));
-                    }
+impl<C> Connection<C> {
+    /// Maps over the connection type
+    pub fn map<D>(self, f: impl FnOnce(C) -> D) -> Connection<D> {
+        Connection {
+            con: f(self.con),
+            db: self.db,
+        }
+    }
+}
+
+/// Specifies how to connect using a `ConnectionInfo`
+pub trait RedisConnection: AsyncWrite + AsyncRead + Unpin + Send + Sized + 'static {
+    /// Connects to `Self` or returns an error otherwise
+    fn connect(connection_info: &ConnectionInfo) -> RedisFuture<'_, Connection<Self>>;
+}
+
+impl RedisConnection for TokioConnection {
+    fn connect(connection_info: &ConnectionInfo) -> RedisFuture<'_, Connection<TokioConnection>> {
+        Box::pin(async move {
+            let con = match *connection_info.addr {
+                ConnectionAddr::Tcp(ref host, port) => {
+                    let socket_addr = {
+                        let mut socket_addrs = (&host[..], port).to_socket_addrs()?;
+                        match socket_addrs.next() {
+                            Some(socket_addr) => socket_addr,
+                            None => {
+                                return Err(RedisError::from((
+                                    ErrorKind::InvalidClientConfig,
+                                    "No address found for host",
+                                )));
+                            }
+                        }
+                    };
+
+                    TcpStream::connect(&socket_addr)
+                        .map_ok(TokioConnection::Tcp)
+                        .await?
+                }
+
+                #[cfg(unix)]
+                ConnectionAddr::Unix(ref path) => {
+                    UnixStream::connect(path)
+                        .map_ok(TokioConnection::Unix)
+                        .await?
+                }
+
+                #[cfg(not(unix))]
+                ConnectionAddr::Unix(_) => {
+                    return Err(RedisError::from((
+                        ErrorKind::InvalidClientConfig,
+                        "Cannot connect to unix sockets \
+                         on this platform",
+                    )))
                 }
             };
 
-            TcpStream::connect(&socket_addr)
-                .map_ok(|con| ActualConnection::Tcp(con))
-                .await?
-        }
+            Ok(Connection {
+                con,
+                db: connection_info.db,
+            })
+        })
+    }
+}
 
-        #[cfg(unix)]
-        ConnectionAddr::Unix(ref path) => {
-            UnixStream::connect(path)
-                .map_ok(|stream| ActualConnection::Unix(stream))
-                .await?
-        }
+impl<C> RedisConnection for BufReader<C>
+where
+    C: RedisConnection,
+{
+    fn connect(connection_info: &ConnectionInfo) -> RedisFuture<'_, Connection<Self>> {
+        Box::pin(async move {
+            Ok(Connection {
+                con: BufReader::new(C::connect(connection_info).await?.con),
+                db: connection_info.db,
+            })
+        })
+    }
+}
 
-        #[cfg(not(unix))]
-        ConnectionAddr::Unix(_) => {
-            return Err(RedisError::from((
-                ErrorKind::InvalidClientConfig,
-                "Cannot connect to unix sockets \
-                 on this platform",
-            )))
-        }
-    };
+impl<C> RedisConnection for BufWriter<C>
+where
+    C: RedisConnection,
+{
+    fn connect(connection_info: &ConnectionInfo) -> RedisFuture<'_, Connection<Self>> {
+        Box::pin(async move {
+            Ok(Connection {
+                con: BufWriter::new(C::connect(connection_info).await?.con),
+                db: connection_info.db,
+            })
+        })
+    }
+}
 
-    let mut rv = Connection {
-        con: BufWriter::new(BufReader::new(con)),
-        db: connection_info.db,
-    };
+/// Opens a connection.
+pub async fn connect<C>(connection_info: &ConnectionInfo) -> RedisResult<Connection<C>>
+where
+    C: RedisConnection + AsyncBufRead,
+{
+    let mut rv = C::connect(connection_info).await?;
 
     if let Some(passwd) = &connection_info.passwd {
         let result = cmd("AUTH")
@@ -200,9 +253,9 @@ pub trait ConnectionLike: Sized {
     fn get_db(&self) -> i64;
 }
 
-impl<W> ConnectionLike for Connection<W>
+impl<C> ConnectionLike for Connection<C>
 where
-    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: AsyncBufRead + AsyncWrite + Unpin + Send + 'static,
 {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
         (async move {
@@ -490,9 +543,9 @@ pub struct MultiplexedConnection {
 
 impl MultiplexedConnection {
     /// Creates a multiplexed connection from a connection and executor.
-    pub(crate) fn new<W>(con: Connection<W>) -> (Self, impl Future<Output = ()>)
+    pub(crate) fn new<C>(con: Connection<C>) -> (Self, impl Future<Output = ()>)
     where
-        W: AsyncRead + AsyncWrite + Send + 'static,
+        C: AsyncRead + AsyncWrite + Send + 'static,
     {
         let codec = ValueCodec::default().framed(con.con);
         let (pipeline, driver) = Pipeline::new(codec);
